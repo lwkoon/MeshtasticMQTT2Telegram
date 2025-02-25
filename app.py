@@ -10,6 +10,7 @@ import logging
 import os
 import base64
 import asyncio
+import threading
 import paho.mqtt.client as mqtt
 
 from meshtastic import mesh_pb2, mqtt_pb2, portnums_pb2, telemetry_pb2, BROADCAST_NUM
@@ -36,8 +37,18 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Create a Telegram Bot object
+# Create a Telegram Bot object without custom request adapter
 bot = Bot(token=TOKEN)
+
+# --- Create a persistent asyncio event loop for sending Telegram messages ---
+telegram_loop = asyncio.new_event_loop()
+
+def start_telegram_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+# Start the telegram loop in a background thread
+threading.Thread(target=start_telegram_loop, args=(telegram_loop,), daemon=True).start()
 
 # Default settings
 MQTT_BROKER = os.getenv("MQTT_BROKER")
@@ -202,8 +213,11 @@ def sendTelegramMsg(text_payload, client_id):
                 print(f"No long name found for client {client_id}")
                 msg_who = f"*{client_id}*:"
 
-            # Using asyncio.run to send Telegram messages
-            asyncio.run(send_telegram_message(bot, TELEGRAM_CHAT_ID, msg_who + text_payload))
+            # --- Instead of asyncio.run, schedule the coroutine on the persistent telegram_loop ---
+            asyncio.run_coroutine_threadsafe(
+                send_telegram_message(bot, TELEGRAM_CHAT_ID, msg_who + text_payload),
+                telegram_loop
+            )
         else:
             print("Received None payload. Ignoring...")
     except Exception as e:
