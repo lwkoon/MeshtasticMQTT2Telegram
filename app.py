@@ -28,17 +28,24 @@ import sqlite3
 # Load the .env file
 load_dotenv()
 
-# Get the token from the environment variable
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
+# --- Logging Configuration: Logs to a file and the console ---
+# Set the log file name from environment or default to "meshtastic.log"
+log_file = os.getenv("LOG_FILE", "meshtastic.log")
 logging.basicConfig(
+    filename=log_file,            # Write logs to this file
+    filemode='a',                 # Append mode (use 'w' to overwrite each time)
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+# Also add a console handler so logs appear in the terminal as well.
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+logging.getLogger().addHandler(console_handler)
 
 # Create a Telegram Bot object without custom request adapter
-bot = Bot(token=TOKEN)
+bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 
 # --- Create a persistent asyncio event loop for sending Telegram messages ---
 telegram_loop = asyncio.new_event_loop()
@@ -71,7 +78,7 @@ async def send_telegram_message(bot, chat_id, text_payload):
     try:
         await bot.send_message(chat_id=chat_id, text=text_payload, parse_mode='MarkdownV2')
     except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+        logging.error(f"Failed to send Telegram message: {e}")
 
 def process_message(mp, text_payload, is_encrypted):
     text = {
@@ -80,7 +87,7 @@ def process_message(mp, text_payload, is_encrypted):
         "id": getattr(mp, "id"),
         "to": getattr(mp, "to")
     }
-    print(text)
+    logging.info(text)
 
 def decode_encrypted(message_packet):
     try:
@@ -100,10 +107,11 @@ def decode_encrypted(message_packet):
 
         # Using getattr to dynamically retrieve the 'from' field
         client_id = create_node_id(getattr(message_packet, 'from', None))
-        print('----------->service_envelope.packet.from', client_id)
+        logging.info('----------->service_envelope.packet.from %s', client_id)
 
         if message_packet.decoded.portnum == portnums_pb2.TEXT_MESSAGE_APP:
             text_payload = message_packet.decoded.payload.decode("utf-8")
+            logging.info('[TEXT_MESSAGE] From %s: %s', client_id, text_payload)
             sendTelegramMsg(text_payload, client_id)
 
         elif message_packet.decoded.portnum == portnums_pb2.NODEINFO_APP:
@@ -111,8 +119,8 @@ def decode_encrypted(message_packet):
             info.ParseFromString(message_packet.decoded.payload)
 
             if info.long_name is not None:
-                print('----->nodeinfo', info)
-                print(f'id:{info.id}, long_name:{info.long_name}')
+                logging.info('----->nodeinfo %s', info)
+                logging.info('id:%s, long_name:%s', info.id, info.long_name)
 
                 try:
                     conn = sqlite3.connect('meshtastic.db')
@@ -135,14 +143,14 @@ def decode_encrypted(message_packet):
                     conn.commit()
                     conn.close()
                 except Exception as e:
-                    print(f"Update node Info failed: {e}")
+                    logging.error("Update node Info failed: %s", e)
 
         elif message_packet.decoded.portnum == portnums_pb2.POSITION_APP:
             pos = mesh_pb2.Position()
             pos.ParseFromString(message_packet.decoded.payload)
 
             if pos.latitude_i != 0:
-                print('----->pos', pos)
+                logging.info('----->pos %s', pos)
                 try:
                     conn = sqlite3.connect('meshtastic.db')
                     cursor = conn.cursor()
@@ -164,22 +172,22 @@ def decode_encrypted(message_packet):
                     conn.commit()
                     conn.close()
                 except Exception as e:
-                    print(f"Update node Position failed: {e}")
+                    logging.error("Update node Position failed: %s", e)
 
         elif message_packet.decoded.portnum == portnums_pb2.TELEMETRY_APP:
             env = telemetry_pb2.Telemetry()
             env.ParseFromString(message_packet.decoded.payload)
-            print('----->env', env)
+            logging.info('----->env %s', env)
 
     except Exception as e:
-        print(f"Decryption failed: {e}")
+        logging.error("Decryption failed: %s", e)
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         client.subscribe(subscribe_topic, 0)
-        print(f"Connected to {MQTT_BROKER} on topic:{subscribe_topic} id:{BROADCAST_NUM} send to telegram:{TELEGRAM_CHAT_ID}")
+        logging.info("Connected to %s on topic:%s id:%s send to telegram:%s", MQTT_BROKER, subscribe_topic, BROADCAST_NUM, os.getenv("TELEGRAM_CHAT_ID"))
     else:
-        print(f"Failed to connect to MQTT broker with result code {rc}")
+        logging.error("Failed to connect to MQTT broker with result code %s", rc)
 
 def on_message(client, userdata, msg):
     service_envelope = mqtt_pb2.ServiceEnvelope()
@@ -187,7 +195,9 @@ def on_message(client, userdata, msg):
         service_envelope.ParseFromString(msg.payload)
         message_packet = service_envelope.packet
     except Exception as e:
-        print(f"Error parsing message_packet: {e}")
+        # These are expected - MQTT publishes various non-protobuf messages (JSON status, stats, etc.)
+        # Only log at DEBUG level to reduce noise
+        logging.debug("Skipped non-protobuf message on topic %s: %s", msg.topic, e)
         return
 
     # Only process messages from a specific channel
@@ -195,11 +205,36 @@ def on_message(client, userdata, msg):
         if message_packet.HasField("encrypted") and not message_packet.HasField("decoded"):
             decode_encrypted(message_packet)
         else:
-            print("----------------------------------*****no decode*****", mesh_pb2.Data())
+            logging.debug("Received unencrypted message (skipped)")
+
+def load_blacklist():
+    """Load blacklisted node IDs from blacklist.txt"""
+    blacklist = set()
+    try:
+        if os.path.exists('blacklist.txt'):
+            with open('blacklist.txt', 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        blacklist.add(line)
+            logging.info(f"Loaded {len(blacklist)} node IDs from blacklist")
+        else:
+            logging.info("No blacklist.txt found, all nodes will be published")
+    except Exception as e:
+        logging.error(f"Error loading blacklist: {e}")
+    return blacklist
 
 def sendTelegramMsg(text_payload, client_id):
     try:
-        print(f'client_id:{client_id} , text_payload: {text_payload}')
+        logging.info('client_id:%s , text_payload: %s', client_id, text_payload)
+
+        # Check if node ID is blacklisted
+        blacklist = load_blacklist()
+        if client_id in blacklist:
+            logging.info(f"Node {client_id} is blacklisted, skipping Telegram publish")
+            return
+
         if text_payload is not None:
             long_name = get_long_name(client_id)
             text_payload = escape_special_characters(text_payload)
@@ -207,21 +242,21 @@ def sendTelegramMsg(text_payload, client_id):
             client_id = escape_special_characters(client_id)
             if long_name is not None:
                 long_name = escape_special_characters(long_name)
-                print(f"The long name of client {client_id} is: {long_name}")
+                logging.info("The long name of client %s is: %s", client_id, long_name)
                 msg_who = f"*{long_name} \\({client_id}\\)*:"
             else:
-                print(f"No long name found for client {client_id}")
+                logging.info("No long name found for client %s", client_id)
                 msg_who = f"*{client_id}*:"
 
             # --- Instead of asyncio.run, schedule the coroutine on the persistent telegram_loop ---
             asyncio.run_coroutine_threadsafe(
-                send_telegram_message(bot, TELEGRAM_CHAT_ID, msg_who + text_payload),
+                send_telegram_message(bot, os.getenv("TELEGRAM_CHAT_ID"), msg_who + text_payload),
                 telegram_loop
             )
         else:
-            print("Received None payload. Ignoring...")
+            logging.info("Received None payload. Ignoring...")
     except Exception as e:
-        print(f"send message to telegram error: {e}")
+        logging.error("send message to telegram error: %s", e)
 
 def get_long_name(client_id):
     conn = sqlite3.connect('meshtastic.db')
@@ -268,7 +303,14 @@ try:
     conn.commit()
     conn.close()
 except Exception as e:
-    print(f"Database initialization failed: {e}")
+    logging.error("Database initialization failed: %s", e)
+
+# Load and display blacklist status at startup
+startup_blacklist = load_blacklist()
+if startup_blacklist:
+    logging.info("[BLACKLIST] Active: %d node(s) will be filtered: %s", len(startup_blacklist), ', '.join(sorted(startup_blacklist)))
+else:
+    logging.info("[BLACKLIST] Inactive - all nodes will be published to Telegram")
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_message = on_message
@@ -283,7 +325,6 @@ if __name__ == '__main__':
     try:
         client.loop_forever()
     except KeyboardInterrupt:
-        print("Program terminated manually.")
+        logging.info("Program terminated manually.")
     except Exception as e:
-        print(f"Unexpected error: {e}")
-
+        logging.error("Unexpected error: %s", e)
