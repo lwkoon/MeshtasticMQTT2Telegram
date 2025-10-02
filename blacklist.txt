@@ -1,0 +1,9 @@
+# Meshtastic Node ID Blacklist
+# Add node IDs (one per line) that should NOT be published to Telegram
+# Format: !xxxxxxxx (where xxxxxxxx is the hex node ID)
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Example blacklisted nodes:
+# !abcd1234
+# !12345678
