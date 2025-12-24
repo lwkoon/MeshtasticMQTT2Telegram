@@ -11,6 +11,7 @@ import os
 import base64
 import asyncio
 import threading
+import time
 import paho.mqtt.client as mqtt
 
 from meshtastic import mesh_pb2, mqtt_pb2, portnums_pb2, telemetry_pb2, BROADCAST_NUM
@@ -64,12 +65,50 @@ MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 
 root_topic = os.getenv("MQTT_ROOT_TOPIC")
-channel = os.getenv("MQTT_CHANNEL")
-key = os.getenv("MQTT_MESH_KEY")
 
-padded_key = key.ljust(len(key) + ((4 - (len(key) % 4)) % 4), '=')
-replaced_key = padded_key.replace('-', '+').replace('_', '/')
-key = replaced_key
+# Support multiple channels - LongFast and MediumFast
+channels = {
+    "LongFast": {
+        "key": os.getenv("MQTT_MESH_KEY_LONGFAST", os.getenv("MQTT_MESH_KEY")),
+        "broadcast_num": BROADCAST_NUM
+    },
+    "MediumFast": {
+        "key": os.getenv("MQTT_MESH_KEY_MEDIUMFAST", os.getenv("MQTT_MESH_KEY")),
+        "broadcast_num": BROADCAST_NUM
+    }
+}
+
+# Process keys for both channels
+for channel_name, channel_config in channels.items():
+    key = channel_config["key"]
+    padded_key = key.ljust(len(key) + ((4 - (len(key) % 4)) % 4), '=')
+    replaced_key = padded_key.replace('-', '+').replace('_', '/')
+    channel_config["key"] = replaced_key
+
+# --- Message Deduplication ---
+# Cache to track seen message IDs with timestamps to prevent duplicate Telegram forwards
+# Duplicates occur when multiple relay nodes publish the same message to MQTT
+DEDUP_WINDOW = int(os.getenv("DEDUP_WINDOW_SECONDS", "300"))  # Default 5 minutes
+seen_messages = {}  # {packet_id: timestamp}
+seen_messages_lock = threading.Lock()
+
+def is_duplicate_message(packet_id):
+    """Check if message was already seen. Returns True if duplicate."""
+    current_time = time.time()
+
+    with seen_messages_lock:
+        # Clean up old entries (older than DEDUP_WINDOW)
+        expired = [pid for pid, ts in seen_messages.items() if current_time - ts > DEDUP_WINDOW]
+        for pid in expired:
+            del seen_messages[pid]
+
+        # Check if this message was already seen
+        if packet_id in seen_messages:
+            return True
+
+        # Mark as seen
+        seen_messages[packet_id] = current_time
+        return False
 
 # Convert hex to int and remove '!'
 # node_number = int('abcd', 16)
@@ -89,7 +128,7 @@ def process_message(mp, text_payload, is_encrypted):
     }
     logging.info(text)
 
-def decode_encrypted(message_packet):
+def decode_encrypted(message_packet, channel_name, key):
     try:
         key_bytes = base64.b64decode(key.encode('ascii'))
 
@@ -107,35 +146,35 @@ def decode_encrypted(message_packet):
 
         # Using getattr to dynamically retrieve the 'from' field
         client_id = create_node_id(getattr(message_packet, 'from', None))
-        logging.info('----------->service_envelope.packet.from %s', client_id)
+        logging.info('----------->service_envelope.packet.from %s [%s]', client_id, channel_name)
 
         if message_packet.decoded.portnum == portnums_pb2.TEXT_MESSAGE_APP:
             text_payload = message_packet.decoded.payload.decode("utf-8")
-            logging.info('[TEXT_MESSAGE] From %s: %s', client_id, text_payload)
-            sendTelegramMsg(text_payload, client_id)
+            logging.info('[TEXT_MESSAGE] From %s [%s]: %s', client_id, channel_name, text_payload)
+            sendTelegramMsg(text_payload, client_id, channel_name)
 
         elif message_packet.decoded.portnum == portnums_pb2.NODEINFO_APP:
             info = mesh_pb2.User()
             info.ParseFromString(message_packet.decoded.payload)
 
             if info.long_name is not None:
-                logging.info('----->nodeinfo %s', info)
+                logging.info('----->nodeinfo [%s] %s', channel_name, info)
                 logging.info('id:%s, long_name:%s', info.id, info.long_name)
 
                 try:
                     conn = sqlite3.connect('meshtastic.db')
                     cursor = conn.cursor()
 
-                    cursor.execute(f'SELECT * FROM {channel} WHERE client_id = ?', (client_id,))
+                    cursor.execute(f'SELECT * FROM {channel_name} WHERE client_id = ?', (client_id,))
                     existing_row = cursor.fetchone()
 
                     if existing_row:
-                        cursor.execute(f'''UPDATE {channel} SET
+                        cursor.execute(f'''UPDATE {channel_name} SET
                                         long_name = ?, short_name = ?
                                         WHERE client_id = ?''',
                                        (info.long_name, info.short_name, client_id))
                     else:
-                        cursor.execute(f'''INSERT INTO {channel}
+                        cursor.execute(f'''INSERT INTO {channel_name}
                                         (client_id, long_name, short_name)
                                         VALUES (?, ?, ?)''',
                                        (client_id, info.long_name, info.short_name))
@@ -143,28 +182,28 @@ def decode_encrypted(message_packet):
                     conn.commit()
                     conn.close()
                 except Exception as e:
-                    logging.error("Update node Info failed: %s", e)
+                    logging.error("Update node Info failed [%s]: %s", channel_name, e)
 
         elif message_packet.decoded.portnum == portnums_pb2.POSITION_APP:
             pos = mesh_pb2.Position()
             pos.ParseFromString(message_packet.decoded.payload)
 
             if pos.latitude_i != 0:
-                logging.info('----->pos %s', pos)
+                logging.info('----->pos [%s] %s', channel_name, pos)
                 try:
                     conn = sqlite3.connect('meshtastic.db')
                     cursor = conn.cursor()
 
-                    cursor.execute(f'SELECT * FROM {channel} WHERE client_id = ?', (client_id,))
+                    cursor.execute(f'SELECT * FROM {channel_name} WHERE client_id = ?', (client_id,))
                     existing_row = cursor.fetchone()
 
                     if existing_row:
-                        cursor.execute(f'''UPDATE {channel} SET
+                        cursor.execute(f'''UPDATE {channel_name} SET
                                         latitude_i = ?, longitude_i = ?, precision_bits = ?
                                         WHERE client_id = ?''',
                                        (pos.latitude_i, pos.longitude_i, pos.precision_bits, client_id))
                     else:
-                        cursor.execute(f'''INSERT INTO {channel}
+                        cursor.execute(f'''INSERT INTO {channel_name}
                                         (client_id, latitude_i, longitude_i, precision_bits)
                                         VALUES (?, ?, ?, ?)''',
                                        (client_id, pos.latitude_i, pos.longitude_i, pos.precision_bits))
@@ -172,20 +211,24 @@ def decode_encrypted(message_packet):
                     conn.commit()
                     conn.close()
                 except Exception as e:
-                    logging.error("Update node Position failed: %s", e)
+                    logging.error("Update node Position failed [%s]: %s", channel_name, e)
 
         elif message_packet.decoded.portnum == portnums_pb2.TELEMETRY_APP:
             env = telemetry_pb2.Telemetry()
             env.ParseFromString(message_packet.decoded.payload)
-            logging.info('----->env %s', env)
+            logging.info('----->env [%s] %s', channel_name, env)
 
     except Exception as e:
-        logging.error("Decryption failed: %s", e)
+        logging.error("Decryption failed [%s]: %s", channel_name, e)
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        client.subscribe(subscribe_topic, 0)
-        logging.info("Connected to %s on topic:%s id:%s send to telegram:%s", MQTT_BROKER, subscribe_topic, BROADCAST_NUM, os.getenv("TELEGRAM_CHAT_ID"))
+        # Subscribe to both LongFast and MediumFast channels
+        for channel_name in channels.keys():
+            subscribe_topic = f"{root_topic}{channel_name}/#"
+            client.subscribe(subscribe_topic, 0)
+            logging.info("Subscribed to %s on topic:%s id:%s", channel_name, subscribe_topic, BROADCAST_NUM)
+        logging.info("Connected to %s, sending to telegram:%s", MQTT_BROKER, os.getenv("TELEGRAM_CHAT_ID"))
     else:
         logging.error("Failed to connect to MQTT broker with result code %s", rc)
 
@@ -200,10 +243,27 @@ def on_message(client, userdata, msg):
         logging.debug("Skipped non-protobuf message on topic %s: %s", msg.topic, e)
         return
 
-    # Only process messages from a specific channel
-    if message_packet.to == BROADCAST_NUM:
+    # Determine which channel this message is from
+    channel_name = None
+    for ch_name in channels.keys():
+        if f"/{ch_name}/" in msg.topic:
+            channel_name = ch_name
+            break
+    
+    if channel_name is None:
+        logging.debug("Message not from a monitored channel: %s", msg.topic)
+        return
+
+    # Deduplication check - skip if we've already processed this packet ID
+    packet_id = getattr(message_packet, "id", None)
+    if packet_id and is_duplicate_message(packet_id):
+        logging.debug("Duplicate message (packet_id=%s) from %s, skipping", packet_id, msg.topic)
+        return
+
+    # Only process messages from the broadcast number
+    if message_packet.to == channels[channel_name]["broadcast_num"]:
         if message_packet.HasField("encrypted") and not message_packet.HasField("decoded"):
-            decode_encrypted(message_packet)
+            decode_encrypted(message_packet, channel_name, channels[channel_name]["key"])
         else:
             logging.debug("Received unencrypted message (skipped)")
 
@@ -225,9 +285,9 @@ def load_blacklist():
         logging.error(f"Error loading blacklist: {e}")
     return blacklist
 
-def sendTelegramMsg(text_payload, client_id):
+def sendTelegramMsg(text_payload, client_id, channel_name):
     try:
-        logging.info('client_id:%s , text_payload: %s', client_id, text_payload)
+        logging.info('client_id:%s , channel:%s, text_payload: %s', client_id, channel_name, text_payload)
 
         # Check if node ID is blacklisted
         blacklist = load_blacklist()
@@ -236,17 +296,19 @@ def sendTelegramMsg(text_payload, client_id):
             return
 
         if text_payload is not None:
-            long_name = get_long_name(client_id)
+            long_name = get_long_name(client_id, channel_name)
             text_payload = escape_special_characters(text_payload)
             text_payload = '\n>' + '\n>'.join(text_payload.split('\n')) + '\r'
-            client_id = escape_special_characters(client_id)
+            client_id_escaped = escape_special_characters(client_id)
+            channel_name_escaped = escape_special_characters(channel_name)
+            
             if long_name is not None:
                 long_name = escape_special_characters(long_name)
-                logging.info("The long name of client %s is: %s", client_id, long_name)
-                msg_who = f"*{long_name} \\({client_id}\\)*:"
+                logging.info("The long name of client %s [%s] is: %s", client_id, channel_name, long_name)
+                msg_who = f"*{long_name} \\({client_id_escaped}\\)* \\[{channel_name_escaped}\\]:"
             else:
-                logging.info("No long name found for client %s", client_id)
-                msg_who = f"*{client_id}*:"
+                logging.info("No long name found for client %s [%s]", client_id, channel_name)
+                msg_who = f"*{client_id_escaped}* \\[{channel_name_escaped}\\]:"
 
             # --- Instead of asyncio.run, schedule the coroutine on the persistent telegram_loop ---
             asyncio.run_coroutine_threadsafe(
@@ -258,16 +320,20 @@ def sendTelegramMsg(text_payload, client_id):
     except Exception as e:
         logging.error("send message to telegram error: %s", e)
 
-def get_long_name(client_id):
-    conn = sqlite3.connect('meshtastic.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT long_name FROM LongFast WHERE client_id = ?", (client_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if row:
-        return row[0]
-    else:
+def get_long_name(client_id, channel_name):
+    try:
+        conn = sqlite3.connect('meshtastic.db')
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT long_name FROM {channel_name} WHERE client_id = ?", (client_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if row:
+            return row[0]
+        else:
+            return None
+    except Exception as e:
+        logging.error(f"Error getting long_name from {channel_name}: {e}")
         return None
 
 def escape_special_characters(text):
@@ -283,23 +349,26 @@ def escape_special_characters(text):
 def create_node_id(node_number):
     return f"!{hex(node_number)[2:]}"
 
-# Establish or connect to the database and create a data table
+# Establish or connect to the database and create data tables for both channels
 try:
     conn = sqlite3.connect('meshtastic.db')
     cursor = conn.cursor()
 
-    create_table_query = f'''CREATE TABLE IF NOT EXISTS LongFast (
-                                client_id TEXT PRIMARY KEY NOT NULL,
-                                long_name TEXT,
-                                short_name TEXT,
-                                macaddr TEXT,
-                                latitude_i TEXT,
-                                longitude_i TEXT,
-                                altitude TEXT,
-                                precision_bits TEXT,
-                                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                            )'''
-    cursor.execute(create_table_query)
+    for channel_name in channels.keys():
+        create_table_query = f'''CREATE TABLE IF NOT EXISTS {channel_name} (
+                                    client_id TEXT PRIMARY KEY NOT NULL,
+                                    long_name TEXT,
+                                    short_name TEXT,
+                                    macaddr TEXT,
+                                    latitude_i TEXT,
+                                    longitude_i TEXT,
+                                    altitude TEXT,
+                                    precision_bits TEXT,
+                                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                )'''
+        cursor.execute(create_table_query)
+        logging.info(f"Table {channel_name} created or already exists")
+    
     conn.commit()
     conn.close()
 except Exception as e:
@@ -312,14 +381,14 @@ if startup_blacklist:
 else:
     logging.info("[BLACKLIST] Inactive - all nodes will be published to Telegram")
 
+# Log deduplication status
+logging.info("[DEDUP] Active with %d second window - duplicate messages will be filtered", DEDUP_WINDOW)
+
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_message = on_message
 client.on_connect = on_connect
 client.username_pw_set(username=MQTT_USERNAME, password=MQTT_PASSWORD)
 client.connect(MQTT_BROKER, MQTT_PORT, 60)
-
-subscribe_topic = f"{root_topic}{channel}/#"
-client.subscribe(subscribe_topic, 0)
 
 if __name__ == '__main__':
     try:
